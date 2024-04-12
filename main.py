@@ -12,11 +12,6 @@ def make_options():
 		description='Send or receive files with a partner.',
 		formatter_class=argparse.RawTextHelpFormatter
 	)
-	# params.add_argument(
-	# 	'--name',
-	# 	help='Friendly name for your partner to see. :)',
-	# 	required=False
-	# )
 	params.add_argument(
 		'-t', '--type',
 		help=
@@ -55,9 +50,6 @@ def validate_ip(ip):
 def validate_options(args):
 	if args.type is None:
 		args.type = 'join'
-	print(f'{args.type.capitalize()}ing session...')
-	# if args.name is None:
-	# 	args.name = input('Your name: ').capitalize()
 	if args.ip is None and args.type == 'join':
 		is_valid = False
 		while not is_valid:
@@ -81,7 +73,6 @@ def validate_options(args):
 
 class Controller:
 	def __init__(self, args):
-		# self.name = args.name
 		self.ip = args.ip
 		self.port = args.port
 		self.is_server = (args.type == 'host')
@@ -94,16 +85,15 @@ class Controller:
 			print(f"Waiting for connection on port:{self.port}...")
 			temp_sock.bind(('', self.port))
 			temp_sock.listen()
-			self.sock, partner_address = temp_sock.accept()
-			self.ip, self.port = self.sock.getsockname()
+			self.sock, self.partner_address = temp_sock.accept()
 			temp_sock.close()
 		else:
 			print(f"Connecting to {self.ip}:{self.port}...")
 			partner_address = (self.ip, self.port)
 			temp_sock.connect(partner_address)
 			self.sock = temp_sock
-			self.partner_address = partner_address
-		print(f"Connection established with {self.ip}:{self.port}")
+			self.partner_address = self.sock.getpeername()
+		print(f"Connection established with {self.partner_address[0]}:{self.partner_address[1]}")
 
 	def stop(self):
 		self.stopping = True
