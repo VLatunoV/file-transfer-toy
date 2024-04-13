@@ -95,25 +95,103 @@ class Controller:
 			self.partner_address = self.sock.getpeername()
 		print(f"Connection established with {self.partner_address[0]}:{self.partner_address[1]}")
 
+	def start_threads(self, send_function, recv_function):
+		self.sender_thread = threading.Thread(target=send_function, args=(self,))
+		self.receiver_thread = threading.Thread(target=recv_function, args=(self,))
+		self.sender_thread.start()
+		self.receiver_thread.start()
+
+	def join(self):
+		self.receiver_thread.join()
+		# Don't wait for the sender thread to finish, as it is likely stuck on input().
+		self.sender_thread.join(timeout=0.1)
+		print("Disconnected.")
+
 	def stop(self):
 		self.stopping = True
 		self.sock.close()
-		print("Disconnected.")
+
+	@staticmethod
+	def thread_function_wrapper(func):
+		def wrapped(controller):
+			try:
+				func(controller)
+			except Exception as e:
+				print(e)
+				controller.stop()
+		return wrapped
 
 class Command:
 	def __init__(self, cmd, desc):
 		self.cmd = cmd
 		self.desc = desc
 
-def format_size(size: int):
+def format_size(size: float):
 	units = ['B', 'KB', 'MB', 'GB']
 	u = 0
 	while u+1 < len(units) and size > 1000:
 		size = size / 1024
 		u += 1
-	return f'{size:.2f} {units[u]}'
+	return f'{size:.2f}{units[u]}'
 
-def send_file(sock: socket.socket, file, filename: str):
+def format_time(duration: float):
+	duration = int(duration)
+	seconds = duration % 60
+	minutes = (duration // 60) % 60
+	hours = (duration // 3600)
+	if hours != 0:
+		return f'{hours}h {minutes}m {seconds}s'
+	if minutes != 0:
+		return f'{minutes}m {seconds}s'
+	return f'{seconds}s'
+
+class ProgressLogger:
+	def __init__(self, msg_format: str, total_size: int):
+		self.orig_msg = msg_format
+		self.msg_format = msg_format + ' [{}/{} ## {:.2f}% ## Net: {}/s ## ETA: {}]   '
+		self.total_size = total_size
+		self.total_size_str = format_size(total_size)
+
+		self.curr_size = 0
+		self.last_size = 0
+		self.last_time = time.time()
+		# Exponential averaging coefficient
+		self.exp_decay = 0.25
+		self.curr_speed = 0.0
+
+	def print_progress(self, sent):
+		self.curr_size += sent
+		curr_time = time.time()
+		delta_time = curr_time - self.last_time
+		if delta_time > 1.0: # One second
+			delta_size = self.curr_size - self.last_size
+			speed = delta_size / delta_time
+			self.curr_speed = self.exp_decay*speed + (1.0-self.exp_decay)*self.curr_speed
+			if self.curr_speed > 1:
+				time_estimate = (self.total_size - self.curr_size) / self.curr_speed
+			else:
+				time_estimate = 365*24*60*60
+			print(self.msg_format.format(
+				format_size(self.curr_size),
+				self.total_size_str,
+				100.0 * (self.curr_size / self.total_size),
+				format_size(self.curr_speed),
+				format_time(time_estimate)
+			), end='\r')
+			self.last_size = self.curr_size
+			self.last_time = curr_time
+
+	def print_progress_complete(self):
+		print(' '*100, end='\r')
+		final_msg = self.orig_msg + ' [{} / {} ## {:.2f}%]'
+		print(final_msg.format(
+			format_size(self.curr_size),
+			self.total_size_str,
+			100.0 * (self.curr_size / self.total_size)
+		))
+
+def send_file(controller: Controller, file, filename: str):
+	sock: socket.socket = controller.sock
 	file.seek(0, os.SEEK_END)
 	file_size = file.tell()
 	file.seek(0, os.SEEK_SET)
@@ -131,42 +209,37 @@ def send_file(sock: socket.socket, file, filename: str):
 	sent = sock.send(struct.pack('!I', file_size))
 
 	# Send file data
-	print_msg = f'Sending file "{filename[:20]}"' + ' [{} / {} ## {:.2f}%]   '
-	total_size_string = format_size(file_size)
-	last_print_time = time.time()
+	prog = ProgressLogger(
+		msg_format=f'Sending file "{filename[:20]}"',
+		total_size=file_size
+	)
 	read_block_size = 1024 * 1024 # 1MB
 	total_sent = 0
-	while total_sent < file_size:
+	while total_sent < file_size and not controller.stopping:
 		to_read = min(read_block_size, file_size - total_sent)
 		data = memoryview(file.read(to_read))
 		if not data:
 			break  # EOF
-		while True:
-			try:
-				sent = sock.send(data)
-			except BlockingIOError:
-				continue
+		while not controller.stopping:
+			sent = sock.send(data)
+			total_sent += sent
+			prog.print_progress(sent)
+			if sent < len(data):
+				data = data[sent:]
 			else:
-				total_sent += sent
-				curr_time = time.time()
-				if curr_time - last_print_time > 0.5:
-					print(print_msg.format(format_size(total_sent), total_size_string, 100.0 * (total_sent / file_size)), end='\r')
-					last_print_time = curr_time
-				if sent < len(data):
-					data = data[sent:]
-				else:
-					break
-	print(print_msg.format(format_size(total_sent), total_size_string, 100.0 * (total_sent / file_size)))
+				break
+	prog.print_progress_complete()
 
+@Controller.thread_function_wrapper
 def send_func(controller: Controller):
-	sock = controller.sock
 	commands = [
 		Command('exit', 'Exit'),
 		Command('end', 'Exit'),
 		Command('send', 'send FILE_NAME - Sends the file to your partner.'),
 		Command('?', 'Print this help.')
 	]
-	help_text = '\n'.join([f'{x.cmd.ljust(10)} {x.desc}' for x in commands])
+	help_text = 'To interrupt press CTRL+C or CTRL+BREAK\n' + \
+		'\n'.join([f'{x.cmd.ljust(10)} {x.desc}' for x in commands])
 	while not controller.stopping:
 		cmd = input('> ')
 		if controller.stopping:
@@ -184,13 +257,9 @@ def send_func(controller: Controller):
 			if not os.path.isfile(filepath):
 				print(f'[ERROR] Path "{filepath}" is not a file')
 				continue
-			try:
-				with open(filepath, 'rb') as f:
-					filename = os.path.basename(filepath)
-					send_file(sock, f, filename)
-			except Exception as e:
-				print(str(type(e)) + str(e))
-				controller.stop()
+			with open(filepath, 'rb') as f:
+				filename = os.path.basename(filepath)
+				send_file(controller, f, filename)
 
 def make_filename(filepath: str):
 	basedir = os.path.dirname(filepath)
@@ -202,7 +271,8 @@ def make_filename(filepath: str):
 		idx += 1
 	return result
 
-def recv_func_inner(controller):
+@Controller.thread_function_wrapper
+def recv_func(controller):
 	sock: socket.socket = controller.sock
 	basedir = os.path.dirname(__file__)
 	recv_folder = os.path.join(basedir, 'received')
@@ -222,7 +292,6 @@ def recv_func_inner(controller):
 					controller.stop()
 				break
 			except Exception as e:
-				print(str(type(e)) + str(e))
 				break
 		if controller.stopping:
 			break
@@ -246,37 +315,22 @@ def recv_func_inner(controller):
 		file_size, = struct.unpack("!I", file_size)
 
 		# File data
-		print_message = f'Downloading file "{filename[:20]}"' + ' [{} / {} ## {:.2f}%]   '
-		total_size_string = format_size(file_size)
-		last_print_time = time.time()
+		prog = ProgressLogger(
+			msg_format=f'Downloading file "{filename[:20]}"',
+			total_size=file_size
+		)
 		filepath = make_filename(os.path.join(recv_folder, filename))
 		with open(filepath, 'wb') as f:
 			total_recv = 0
 			while total_recv < file_size:
 				read_bytes = min(read_block_size, file_size - total_recv)
-				while True:
-					try:
-						data = sock.recv(read_bytes)
-					except BlockingIOError:
-						continue
-					else:
-						if not data:
-							raise ConnectionError("Connection closed")
-						f.write(data)
-						total_recv += len(data)
-						curr_time = time.time()
-						if curr_time - last_print_time > 0.5:
-							print(print_message.format(format_size(total_recv), total_size_string, 100.0 * (total_recv / file_size)), end='\r')
-							last_print_time = curr_time
-						break
-		print(print_message.format(format_size(total_recv), total_size_string, 100.0 * (total_recv / file_size)))
-
-def recv_func(controller: Controller):
-	try:
-		recv_func_inner(controller)
-	except Exception as e:
-		print(str(type(e)) + str(e))
-		controller.stop()
+				data = sock.recv(read_bytes)
+				if not data:
+					raise ConnectionError("Connection closed")
+				f.write(data)
+				total_recv += len(data)
+				prog.print_progress(len(data))
+		prog.print_progress_complete()
 
 if __name__ == '__main__':
 	args = make_options()
@@ -284,10 +338,5 @@ if __name__ == '__main__':
 	
 	controller = Controller(args)
 	controller.make_connection()
-	recver_thread = threading.Thread(target=recv_func, args=(controller,))
-	recver_thread.start()
-	try:
-		send_func(controller)
-	except:
-		controller.stop()
-	recver_thread.join()
+	controller.start_threads(send_func, recv_func)
+	controller.join()
